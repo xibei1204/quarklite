@@ -10,11 +10,20 @@
 - BT / 磁力链接下载（Android / Windows；iOS 暂不支持）
 - **上传：多文件上传、文件夹上传（保持目录结构），实时查看进度/速度，支持取消与重试**
 
+## 下载 Windows 安装包
+
+打开本仓库的 [Build Windows Installer](https://github.com/xibei1204/quarklite/actions/workflows/build-windows.yml)，选择最新成功的构建，在 **Artifacts** 中下载 `quarklite-windows-installer`，解压后运行 `quarklite-版本号-setup.exe`。
+
+- 支持 Windows 10 / 11 x64，安装包包含 Gopeed 下载引擎和 VC++ 运行库。
+- `main` 分支的应用代码或 Windows 打包配置变更会自动构建，也可以在工作流页面点击 **Run workflow** 手动构建。
+- 同时提供 `quarklite-windows-x64` 便携包，解压后运行 `quarklite.exe`，保留同目录的 DLL、`gopeed.exe` 和 `data` 文件夹。
+- Artifacts 保留 30 天；推送与 `pubspec.yaml` 版本一致的 `v*` 标签（例如 `v1.3.3`）时，会把安装包、便携包和 SHA256 校验文件上传到对应的 [Release](https://github.com/xibei1204/quarklite/releases)。
+
 ## 下载 APK
 
 在 GitHub Actions 页面打开最新的构建（workflow run），下载 **quarklite-apk** 工件：
 
-1. 打开仓库的 [Actions](https://github.com/zxeb/quarklite/actions) 页面
+1. 打开仓库的 [Actions](https://github.com/xibei1204/quarklite/actions) 页面
 2. 点击最新一次成功的构建
 3. 在 Artifacts 区域下载 `quarklite-apk`
 

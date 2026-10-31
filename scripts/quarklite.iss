@@ -1,6 +1,6 @@
 #define MyAppName "Quarklite"
 #ifndef AppVersion
-  #define AppVersion "1.3.0"
+  #error "Pass the app version with /DAppVersion when invoking ISCC"
 #endif
 #define MyAppExeName "quarklite.exe"
 #define MyAppPublisher "QuarkLite"
@@ -18,7 +18,9 @@ SetupIconFile=..\windows\runner\resources\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
 SolidCompression=yes
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0
 WizardStyle=modern
 DisableProgramGroupPage=yes
 

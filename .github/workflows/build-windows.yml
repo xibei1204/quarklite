@@ -1,90 +1,198 @@
-name: Build Windows Release
+name: Build Windows Installer
 
 on:
   workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/build-windows.yml'
+      - 'lib/**'
+      - 'assets/**'
+      - 'windows/**'
+      - 'scripts/quarklite.iss'
+      - 'scripts/languages/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
+
+      - name: Read app version
+        id: version
+        run: |
+          $match = [regex]::Match((Get-Content pubspec.yaml -Raw), '(?m)^version:\s*(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+[0-9A-Za-z.-]+)?\s*$')
+          if (-not $match.Success) { throw 'Cannot read version from pubspec.yaml' }
+          $version = $match.Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match app version v$version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building Quarklite $version for Windows x64"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          # 先看 pubspec.yaml 的 environment.sdk 约束再定版本
-          # 如果 stable 最新版构建报错, 改成项目要求的版本, 例如 3.24.5
           channel: stable
+          flutter-version: '3.47.9'
           cache: true
 
-      - name: Enable Windows Desktop
-        run: flutter config --enable-windows-desktop
-
-      - name: Flutter doctor
-        run: flutter doctor -v
-
       - name: Install Dart dependencies
-        run: flutter pub get
-
-      # ---- 可选: 编译 Gopeed 的 Windows DLL ----
-      # 这一步依赖仓库里存在 Gopeed 源码和 Windows 端 C 绑定
-      # 如果 build_libgopeed.sh 只适配了 Android, 这里很可能失败
-      # 失败不影响主构建, 但运行时下载功能会缺失, 需要手动补齐
-      - name: Build Gopeed Windows library (best-effort)
-        if: hashFiles('gopeed/go.mod') != ''
-        continue-on-error: true
-        shell: bash
         run: |
-          go version
-          cd gopeed
-          # 按仓库实际绑定目录调整, 常见为 ./bind/windows
-          go build -buildmode=c-shared -o ../windows/runner/libgopeed.dll ./bind/windows
+          flutter config --enable-windows-desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          flutter pub get
+
+      - name: Download Gopeed engine
+        env:
+          GOPEED_VERSION: v1.9.3
+          GOPEED_SHA256: ee3d41fa19c366b820a2483619328156579108ac03c53ea35cdb33327320f756
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'gopeed.zip'
+          $extractDir = Join-Path $env:RUNNER_TEMP 'gopeed'
+          $url = "https://github.com/GopeedLab/gopeed/releases/download/$env:GOPEED_VERSION/gopeed-web-$env:GOPEED_VERSION-windows-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $env:GOPEED_SHA256) {
+            throw 'Gopeed archive SHA256 mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractDir
+          $engines = @(Get-ChildItem -LiteralPath $extractDir -Filter 'gopeed*.exe' -File -Recurse)
+          if ($engines.Count -ne 1) { throw 'Expected exactly one Gopeed executable' }
+          New-Item -ItemType Directory -Force -Path windows/resources | Out-Null
+          Copy-Item -LiteralPath $engines[0].FullName -Destination windows/resources/gopeed.exe
 
       - name: Build Windows release
         run: flutter build windows --release
 
-      - name: Copy Gopeed DLL into Release folder
-        shell: bash
+      - name: Bundle VC++ runtime and check required files
         run: |
-          if [ -f windows/runner/libgopeed.dll ]; then
-            cp windows/runner/libgopeed.dll build/windows/x64/runner/Release/
-            echo "libgopeed.dll copied."
-          else
-            echo "::warning::libgopeed.dll not found, download function may not work."
-          fi
+          $releaseDir = 'build/windows/x64/runner/Release'
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsRoot) { throw 'Cannot locate Visual Studio C++ tools' }
+          $crtDirectory = Get-ChildItem -Path "$vsRoot/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT" -Directory |
+            Sort-Object { [version] $_.Parent.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $crtDirectory) { throw 'Cannot locate the x64 VC++ runtime' }
+          Get-ChildItem -LiteralPath $crtDirectory.FullName -Filter '*.dll' -File |
+            Copy-Item -Destination $releaseDir
+          $required = @('quarklite.exe', 'gopeed.exe', 'flutter_windows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'data/app.so', 'data/icudtl.dat', 'data/flutter_assets')
+          foreach ($file in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $releaseDir $file))) {
+              throw "Missing required release file: $file"
+            }
+          }
 
-      - name: List build output
-        shell: bash
-        run: ls -la build/windows/x64/runner/Release/
+      - name: Install Inno Setup
+        env:
+          INNO_SHA256: 8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
+          $compilerDir = Join-Path $env:RUNNER_TEMP 'inno-setup'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $env:INNO_SHA256) {
+            throw 'Inno Setup download SHA256 mismatch'
+          }
+          $process = Start-Process -FilePath $installer -WindowStyle Hidden -Wait -PassThru -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$compilerDir`"")
+          if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
+          if (-not (Test-Path -LiteralPath "$compilerDir/ISCC.exe")) { throw 'ISCC.exe was not installed' }
 
-      - name: Upload artifact
+      - name: Build exe installer
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          & "$env:RUNNER_TEMP/inno-setup/ISCC.exe" "/DAppVersion=$env:APP_VERSION" scripts/quarklite.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installer = "build/installer/quarklite-$env:APP_VERSION-setup.exe"
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Missing installer: $installer" }
+
+      - name: Verify silent installation
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installer = (Resolve-Path "build/installer/quarklite-$env:APP_VERSION-setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP 'quarklite-install-test'
+          $process = Start-Process -FilePath $installer -WindowStyle Hidden -Wait -PassThru -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$installDir`"")
+          if ($process.ExitCode -ne 0) { throw "Silent installation failed: $($process.ExitCode)" }
+          $releaseDir = (Resolve-Path 'build/windows/x64/runner/Release').Path
+          $files = @(Get-ChildItem -LiteralPath $releaseDir -File -Recurse)
+          foreach ($file in $files) {
+            $relativePath = [IO.Path]::GetRelativePath($releaseDir, $file.FullName)
+            $installedFile = Join-Path $installDir $relativePath
+            if (-not (Test-Path -LiteralPath $installedFile -PathType Leaf)) {
+              throw "Installer omitted file: $relativePath"
+            }
+            if ((Get-FileHash -LiteralPath $file.FullName).Hash -ne (Get-FileHash -LiteralPath $installedFile).Hash) {
+              throw "Installed file differs from build output: $relativePath"
+            }
+          }
+          Write-Host "Verified all $($files.Count) installed files against the release bundle"
+
+      - name: Package portable zip and checksums
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          Compress-Archive -Path 'build/windows/x64/runner/Release/*' -DestinationPath "build/installer/quarklite-$env:APP_VERSION-windows-x64.zip"
+          Get-ChildItem -Path 'build/installer/*' -File | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Set-Content -LiteralPath "$($_.FullName).sha256" -Encoding ascii
+          }
+
+      - name: Upload exe installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarklite-windows-installer
+          path: |
+            build/installer/*-setup.exe
+            build/installer/*-setup.exe.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload portable zip
         uses: actions/upload-artifact@v4
         with:
           name: quarklite-windows-x64
-          path: build/windows/x64/runner/Release/
+          path: |
+            build/installer/*-windows-x64.zip
+            build/installer/*-windows-x64.zip.sha256
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
 
-      - name: Package zip (tag only)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          cd build/windows/x64/runner/Release
-          powershell -Command "Compress-Archive -Path * -DestinationPath $env:GITHUB_WORKSPACE/quarklite-windows-x64.zip -Force"
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: quarklite-windows-*
+          merge-multiple: true
+          path: release
 
-      - name: Create GitHub Release (tag only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish Windows release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: quarklite-windows-x64.zip
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
