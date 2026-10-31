@@ -1,0 +1,90 @@
+name: Build Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # 先看 pubspec.yaml 的 environment.sdk 约束再定版本
+          # 如果 stable 最新版构建报错, 改成项目要求的版本, 例如 3.24.5
+          channel: stable
+          cache: true
+
+      - name: Enable Windows Desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Install Dart dependencies
+        run: flutter pub get
+
+      # ---- 可选: 编译 Gopeed 的 Windows DLL ----
+      # 这一步依赖仓库里存在 Gopeed 源码和 Windows 端 C 绑定
+      # 如果 build_libgopeed.sh 只适配了 Android, 这里很可能失败
+      # 失败不影响主构建, 但运行时下载功能会缺失, 需要手动补齐
+      - name: Build Gopeed Windows library (best-effort)
+        if: hashFiles('gopeed/go.mod') != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          go version
+          cd gopeed
+          # 按仓库实际绑定目录调整, 常见为 ./bind/windows
+          go build -buildmode=c-shared -o ../windows/runner/libgopeed.dll ./bind/windows
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Copy Gopeed DLL into Release folder
+        shell: bash
+        run: |
+          if [ -f windows/runner/libgopeed.dll ]; then
+            cp windows/runner/libgopeed.dll build/windows/x64/runner/Release/
+            echo "libgopeed.dll copied."
+          else
+            echo "::warning::libgopeed.dll not found, download function may not work."
+          fi
+
+      - name: List build output
+        shell: bash
+        run: ls -la build/windows/x64/runner/Release/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarklite-windows-x64
+          path: build/windows/x64/runner/Release/
+          if-no-files-found: error
+
+      - name: Package zip (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cd build/windows/x64/runner/Release
+          powershell -Command "Compress-Archive -Path * -DestinationPath $env:GITHUB_WORKSPACE/quarklite-windows-x64.zip -Force"
+
+      - name: Create GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: quarklite-windows-x64.zip
